@@ -1,0 +1,17 @@
+{
+  "name": "binmedia-server",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Bin Media backend: tai khoan Free/VIP, session, metadata video, module nguon Facebook",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.11.5"
+  }
+}
