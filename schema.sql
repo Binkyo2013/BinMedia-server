@@ -112,5 +112,14 @@ CREATE TABLE IF NOT EXISTS vip_device_bindings (
     device_id TEXT NOT NULL CHECK (device_id ~ '^[A-Za-z0-9_-]{16,128}$'),
     bound_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Additive VIP link-code migration. The generated code itself is returned once
+-- only; database persistence is a SHA-256 digest, not plaintext and not HMAC.
+CREATE TABLE IF NOT EXISTS vip_link_codes (
+    account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL CHECK (code_hash ~ '^[0-9a-f]{64}$'),
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_id TEXT;
 -- Legacy VIP sessions have NULL device_id and must log in again.
