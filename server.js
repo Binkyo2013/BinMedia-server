@@ -77,6 +77,7 @@ function loadConfig(env, overrides) {
 
         // Tài khoản Free / khóa VIP
         freeDurationHours: parseInt(env.FREE_DURATION_HOURS || '48', 10),
+        vipSessionTtlMs: parseInt(env.VIP_SESSION_TTL_MS || String(30 * 24 * 3600 * 1000), 10),
         vipFailLimit: parseInt(env.VIP_FAIL_LIMIT || '5', 10),
         vipLockSeconds: parseInt(env.VIP_LOCK_SECONDS || '300', 10),
 
@@ -99,6 +100,7 @@ function loadConfig(env, overrides) {
         var keys = Object.keys(overrides);
         for (var i = 0; i < keys.length; i++) c[keys[i]] = overrides[keys[i]];
     }
+    if (!Number.isSafeInteger(c.vipSessionTtlMs) || c.vipSessionTtlMs <= 0) throw new Error('VIP_SESSION_TTL_MS invalid');
     if (!c.now) c.now = function () { return Date.now(); };
     return c;
 }
@@ -123,27 +125,31 @@ function makeLogger() {
 
 // ---------------------------------------------------------------------------
 // Danh sách VIP trên GitLab (hoặc static/file cho dev/test)
-// TTL + stale-if-error: nguồn lỗi vẫn dùng dữ liệu cũ tối đa vipStaleMaxMs.
+// Strict TTL: expired data is never used for authentication; retry on demand.
 // ---------------------------------------------------------------------------
 function createVipList(config, log) {
     var state = {
         keys: new Set(),       // nameKey (không phân biệt hoa/thường)
-        names: [],             // tên gốc (KHÔNG BAO GIỜ trả ra ngoài)
         loadedAt: 0,
         ok: false,
         error: null,
     };
 
+    var inFlight = null;
+    var retryAt = 0;
+    var ttl = config.vipListTtlMs;
+    if (!Number.isSafeInteger(ttl) || ttl <= 0) throw new Error("VIP_LIST_TTL_MS invalid");
+
     function parseList(text) {
-        var t = String(text || '').trim();
-        if (!t) return [];
-        try {
-            var j = JSON.parse(t);
-            if (Array.isArray(j)) {
-                return j.filter(function (x) { return typeof x === 'string'; });
-            }
-        } catch (e) { /* không phải JSON → danh sách theo dòng */ }
-        return t.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+        var t = String(text || '').replace(/^\uFEFF/, '').trim();
+        var names;
+        if (!t) names = [];
+        else if (/^[\[{]/.test(t)) {
+            names = JSON.parse(t);
+            if (!Array.isArray(names)) throw new Error('invalid list');
+        } else names = t.split(/\r?\n/).map(function (n) { return n.trim(); }).filter(Boolean);
+        if (names.some(function (n) { return !core.normalizeName(n); })) throw new Error('invalid name');
+        return names.map(core.normalizeName);
     }
 
     function fetchGitLab() {
@@ -156,14 +162,22 @@ function createVipList(config, log) {
             if (config.gitlabToken) headers['PRIVATE-TOKEN'] = config.gitlabToken;
             var req = https.request({ hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: 'GET', headers: headers }, function (res) {
                 var buf = '';
-                res.on('data', function (c) { if (buf.length < 2 * 1024 * 1024) buf += c; });
+                res.on('data', function (c) {
+                    buf += c;
+                    if (Buffer.byteLength(buf) > 2 * 1024 * 1024) req.destroy(new Error('response too large'));
+                });
+                res.on('error', reject);
+                res.on('aborted', function () { reject(new Error('response aborted')); });
                 res.on('end', function () {
                     if (res.statusCode < 200 || res.statusCode >= 300) {
                         return reject(new Error('GitLab VIP list: HTTP ' + res.statusCode));
                     }
                     try {
                         var data = JSON.parse(buf);
-                        resolve(Buffer.from(String(data.content || '').replace(/\n/g, ''), 'base64').toString('utf8'));
+                        if (data.encoding !== 'base64' || typeof data.content !== 'string') throw new Error('invalid content');
+                        var encoded = data.content.replace(/\s/g, '');
+                        if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new Error('invalid base64');
+                        resolve(Buffer.from(encoded, 'base64').toString('utf8'));
                     } catch (e) {
                         reject(new Error('GitLab VIP list: response khong hop le'));
                     }
@@ -185,48 +199,47 @@ function createVipList(config, log) {
         if (config.vipSource === 'gitlab') {
             return fetchGitLab();
         }
-        return Promise.reject(new Error('vip source khong ho tro: ' + config.vipSource));
+        return Promise.reject(new Error('unsupported VIP source'));
     }
 
-    async function refresh() {
-        try {
-            var text = await fetchSource();
-            var names = parseList(text);
-            state.keys = new Set(names.map(function (n) { return core.nameKey(n); }));
-            state.names = names;
-            state.loadedAt = config.now();
-            state.ok = true;
-            state.error = null;
-            log('info', 'vip list loaded', { source: config.vipSource, count: names.length });
-            return true;
-        } catch (e) {
-            state.error = e.message;
-            log('error', 'vip list load failed', { source: config.vipSource, error: e.message });
-            return false;
-        }
+    function fresh() {
+        return state.ok && config.now() >= state.loadedAt && config.now() - state.loadedAt < ttl;
     }
-
-    function freshness() {
-        if (state.loadedAt && state.ok) return 'fresh';
-        if (state.loadedAt && (config.now() - state.loadedAt) <= config.vipStaleMaxMs) return 'stale';
-        return 'unknown';
+    function refresh() {
+        if (inFlight) return inFlight;
+        inFlight = (async function () {
+            try {
+                var names = parseList(await fetchSource());
+                state.keys = new Set(names.map(core.nameKey));
+                state.loadedAt = config.now();
+                state.ok = true;
+                state.error = null;
+                retryAt = 0;
+                log('info', 'vip list loaded', { count: state.keys.size });
+                return true;
+            } catch (_) {
+                state.ok = false;
+                state.error = 'VIP_SOURCE_UNAVAILABLE';
+                retryAt = config.now() + Math.min(ttl, 5000);
+                log('error', 'vip list load failed', { code: state.error });
+                return false;
+            }
+        })().finally(function () { inFlight = null; });
+        return inFlight;
     }
-
     return {
         refresh: refresh,
-        // { known, member, stale } — known=false nghĩa là KHÔNG xác định được
-        check: function (nameKeyValue) {
-            var f = freshness();
-            if (f === 'unknown') return { known: false, member: false, stale: false };
-            return { known: true, member: state.keys.has(nameKeyValue), stale: f === 'stale' };
+        check: async function (nameKeyValue) {
+            if (!fresh() && (inFlight || config.now() >= retryAt)) await refresh();
+            if (!fresh()) return { known: false, member: false, stale: false };
+            return { known: true, member: state.keys.has(nameKeyValue), stale: false };
         },
         state: function () {
             return {
-                source: config.vipSource,
-                ok: state.ok,
-                count: state.keys.size,
-                loadedAt: state.loadedAt ? new Date(state.loadedAt).toISOString() : null,
-                stale: freshness() === 'stale',
+                source: ['gitlab', 'file', 'static'].includes(config.vipSource) ? config.vipSource : 'unsupported',
+                ok: fresh(), count: state.keys.size,
+                loadedAt: state.ok || state.loadedAt ? new Date(state.loadedAt).toISOString() : null,
+                stale: !fresh() && state.keys.size > 0,
                 error: state.error,
             };
         },
@@ -373,7 +386,7 @@ function createApp(opts) {
         };
     }
 
-    async function createSessionFor(acc, ip, ua) {
+    async function createSessionFor(acc, ip, ua, deviceId) {
         var now = config.now();
         var token = core.newSessionToken();
         var session = {
@@ -381,7 +394,8 @@ function createApp(opts) {
             tokenHash: core.hashToken(token), // chỉ hash — token thô KHÔNG lưu
             accountId: acc.id,
             createdAt: now,
-            expiresAt: acc.type === 'free' ? acc.freeExpiresAt : null,
+            expiresAt: acc.type === 'free' ? acc.freeExpiresAt : now + config.vipSessionTtlMs,
+            deviceId: acc.type === 'vip' ? deviceId : null,
             revokedAt: null,
             lastSeenAt: now,
             ip: ip,
@@ -410,7 +424,14 @@ function createApp(opts) {
                 throw codedError(E.FREE_EXPIRED, 403, 'tai khoan Free da het han 48 gio');
             }
         } else if (acc.type === 'vip') {
-            var v = vipList.check(acc.nameKey);
+            var deviceId = req.headers['x-device-id'];
+            if (!core.isValidDeviceId(deviceId)) throw codedError(E.DEVICE_INVALID, 400, 'can X-Device-ID hop le');
+            if (!session.deviceId) throw codedError(E.SESSION_INVALID, 401, 'can dang nhap lai de lien ket thiet bi');
+            var binding = await store.getVipDevice(acc.id);
+            if (!binding || binding.deviceId !== deviceId || session.deviceId !== deviceId) {
+                throw codedError(E.VIP_DEVICE_MISMATCH, 403, 'thiet bi khong khop lien ket VIP');
+            }
+            var v = await vipList.check(acc.nameKey);
             if (!v.known) {
                 throw codedError(E.VIP_SOURCE_UNAVAILABLE, 503, 'khong xac minh duoc quyen VIP luc nay');
             }
@@ -418,7 +439,7 @@ function createApp(opts) {
                 throw codedError(E.VIP_INACTIVE, 403, 'quyen VIP khong con hieu luc');
             }
         }
-        if (session.expiresAt && now > session.expiresAt) {
+        if (session.expiresAt && now >= session.expiresAt) {
             throw codedError(E.SESSION_EXPIRED, 401, 'session da het han');
         }
         store.touchSession(session.id, now).catch(function () {});
@@ -487,7 +508,7 @@ function createApp(opts) {
         var nk = core.nameKey(name);
 
         // Không cho đăng ký Free bằng tên nằm trong danh sách VIP (không hé lộ danh sách)
-        var v = vipList.check(nk);
+        var v = await vipList.check(nk);
         if (!v.known) {
             throw codedError(E.SERVICE_UNAVAILABLE, 503, 'khong xac minh duoc ten tai khoan luc nay');
         }
@@ -542,11 +563,7 @@ function createApp(opts) {
         if (acc.type === 'free' && now >= acc.freeExpiresAt) {
             throw codedError(E.FREE_EXPIRED, 403, 'tai khoan Free da het han 48 gio');
         }
-        if (acc.type === 'vip') {
-            var v = vipList.check(acc.nameKey);
-            if (!v.known) throw codedError(E.VIP_SOURCE_UNAVAILABLE, 503, 'khong xac minh duoc quyen VIP luc nay');
-            if (!v.member) throw codedError(E.VIP_INACTIVE, 403, 'quyen VIP khong con hieu luc');
-        }
+        if (acc.type === 'vip') throw codedError(E.SESSION_REQUIRED, 401, 'su dung session VIP hoac dang nhap VIP lai');
         var created = await createSessionFor(acc, ctx.ip, ctx.ua);
         log('info', 'restore ok', { accountId: acc.id, ip: ctx.ip });
         return {
@@ -583,13 +600,15 @@ function createApp(opts) {
         core.gateHit(rateGate, now, policies.vipRate);
         await store.saveAttempt(rateKeys[0], rateGate);
 
+        if (!core.isValidDeviceId(deviceId)) throw codedError(E.DEVICE_INVALID, 400, 'ma thiet bi khong hop le');
+
         // Tên không hợp lệ cũng tính là 1 lần sai (không lộ danh sách VIP)
         if (!name) {
             await gateFailAll(failKeys, policies.vipFail);
             throw codedError(E.VIP_INVALID, 401, 'ten VIP khong hop le');
         }
 
-        var v = vipList.check(nk);
+        var v = await vipList.check(nk);
         if (!v.known) {
             // Không xác minh được danh sách → KHÔNG cấp quyền mới, không tính lần sai
             throw codedError(E.VIP_SOURCE_UNAVAILABLE, 503, 'khong xac minh duoc danh sach VIP luc nay');
@@ -601,37 +620,16 @@ function createApp(opts) {
                 retryAfterSec ? { retryAfterSec: retryAfterSec } : undefined);
         }
 
-        await gateSuccessAll(failKeys);
-
-        var acc = await store.getAccountByNameKey(nk);
-        if (!acc) {
-            acc = await store.saveAccount({
-                id: core.newId('acc_'),
-                name: name,
-                nameKey: nk,
-                type: 'vip',
-                deviceId: null,
-                lastDeviceId: core.isValidDeviceId(deviceId) ? deviceId : null,
-                createdAt: now,
-                freeExpiresAt: null,
-                historyConsent: null,
-                status: 'active',
-                updatedAt: now,
-            });
-        } else if (acc.type === 'free') {
-            // Tên Free được admin đưa vào danh sách VIP → nâng quyền theo server
-            acc.type = 'vip';
-            acc.freeExpiresAt = null;
-            if (core.isValidDeviceId(deviceId)) acc.lastDeviceId = deviceId;
-            acc = await store.saveAccount(acc);
-        } else {
-            if (core.isValidDeviceId(deviceId)) {
-                acc.lastDeviceId = deviceId;
-                acc = await store.saveAccount(acc);
-            }
+        var acc;
+        try {
+            acc = await store.claimVipDevice({ accountId: core.newId('acc_'), name: name,
+                nameKey: nk, deviceId: deviceId, now: now });
+        } catch (e) {
+            if (e.code === E.VIP_DEVICE_MISMATCH) await gateFailAll(failKeys, policies.vipFail);
+            throw e;
         }
-
-        var created = await createSessionFor(acc, ctx.ip, ctx.ua);
+        await gateSuccessAll(failKeys);
+        var created = await createSessionFor(acc, ctx.ip, ctx.ua, deviceId);
         log('info', 'vip login ok', { accountId: acc.id, ip: ctx.ip });
         return {
             token: created.token,
@@ -1080,7 +1078,7 @@ function createApp(opts) {
             return {
                 ok: !!(ping && ping.ok),
                 version: VERSION,
-                store: { ok: !!(ping && ping.ok), driver: config.storeDriver, error: ping && ping.error || null },
+                store: { ok: !!(ping && ping.ok), driver: config.storeDriver, error: ping && ping.ok ? null : 'STORE_UNAVAILABLE' },
                 vipList: vipList.state(),
                 serverTime: new Date(config.now()).toISOString(),
                 uptimeSec: Math.floor(process.uptime()),
@@ -1129,7 +1127,7 @@ function createApp(opts) {
         var ip = clientIp(req, config);
         res.setHeader('Access-Control-Allow-Origin', config.corsOrigin);
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Token');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Token, X-Device-ID');
 
         if (req.method === 'OPTIONS') {
             res.writeHead(204, { 'Access-Control-Max-Age': '600' });
@@ -1170,9 +1168,9 @@ function createApp(opts) {
             return send(res, 200, out === undefined ? { ok: true } : out);
         } catch (e) {
             var status = e.httpStatus || 500;
-            var code = e.code || E.INTERNAL;
+            var code = e.httpStatus ? (e.code || E.INTERNAL) : E.INTERNAL;
             if (status >= 500) {
-                log('error', 'request failed', { reqId: reqId, method: req.method, path: url.pathname, code: code, error: e.message, stack: (e.stack || '').split('\n')[1] || '' });
+                log('error', 'request failed', { reqId: reqId, method: req.method, path: url.pathname, code: code, error: 'INTERNAL_REQUEST_FAILURE' });
             } else {
                 log('info', 'request', { reqId: reqId, method: req.method, path: url.pathname, status: status, code: code, ms: Date.now() - started, ip: ip });
             }
@@ -1220,7 +1218,7 @@ async function startServer() {
     try {
         store = await storeLib.createStore(config);
     } catch (e) {
-        log('error', 'khong khoi tao duoc CSDL — dung server (fail-closed)', { error: e.message });
+        log('error', 'khong khoi tao duoc CSDL — dung server (fail-closed)', { code: 'STORE_INIT_FAILED' });
         process.exitCode = 1;
         return null;
     }

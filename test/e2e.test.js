@@ -34,6 +34,8 @@ async function startApp(opts) {
     var url = 'http://127.0.0.1:' + app.server.address().port;
     return {
         url: url,
+        store: store,
+        app: app,
         config: config,
         dataFile: config.dataFile,
         advance: function (ms) { fakeNow += ms; },
@@ -49,6 +51,7 @@ async function startApp(opts) {
 async function api(t, method, p, opts) {
     opts = opts || {};
     var headers = { 'Content-Type': 'application/json' };
+    if (opts.deviceId !== undefined) headers['X-Device-ID'] = opts.deviceId;
     if (opts.token) headers['Authorization'] = 'Bearer ' + opts.token;
     if (opts.admin) headers['Authorization'] = 'Bearer ' + ADMIN;
     if (opts.rawAdminToken !== undefined) headers['Authorization'] = 'Bearer ' + opts.rawAdminToken;
@@ -190,7 +193,7 @@ test('restore: thiết bị đã đăng ký lấy lại session khi còn hạn',
 test('login-vip: đúng tên → session VIP, sai tên → VIP_INVALID', async function () {
     var t = await startApp({ vipNames: ['vip_one'] });
     try {
-        var bad = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'khong_ton_tai' } });
+        var bad = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'khong_ton_tai', deviceId: DEV_A } });
         assert.strictEqual(bad.status, 401);
         assert.strictEqual(bad.json.error.code, 'VIP_INVALID');
 
@@ -199,7 +202,7 @@ test('login-vip: đúng tên → session VIP, sai tên → VIP_INVALID', async f
         assert.strictEqual(ok.json.account.type, 'vip');
         assert.strictEqual(ok.json.account.freeExpiresAt, null, 'VIP không giới hạn thời gian');
 
-        var me = await api(t, 'GET', '/api/me', { token: ok.json.token });
+        var me = await api(t, 'GET', '/api/me', { token: ok.json.token, deviceId: DEV_A });
         assert.strictEqual(me.status, 200);
         assert.strictEqual(me.json.account.type, 'vip');
     } finally { await t.close(); }
@@ -270,7 +273,7 @@ test('VIP bị gỡ khỏi danh sách → session không còn quyền (VIP_INACT
 
     var t2 = await startApp({ vipNames: [], dataFile: dataFile });
     try {
-        var me = await api(t2, 'GET', '/api/me', { token: token });
+        var me = await api(t2, 'GET', '/api/me', { token: token, deviceId: DEV_A });
         assert.strictEqual(me.status, 403);
         assert.strictEqual(me.json.error.code, 'VIP_INACTIVE');
     } finally { await t2.close(); }
@@ -464,5 +467,164 @@ test('/health và /api/admin/status: giám sát hệ thống', async function ()
         assert.strictEqual(s.status, 200);
         assert.strictEqual(s.json.version, serverLib.VERSION);
         assert.ok(s.json.data);
+    } finally { await t.close(); }
+});
+
+// Device binding contract: synthetic identities only.
+test('VIP requires valid Device ID; missing/mismatched header cannot use a token', async function () {
+    var t = await startApp();
+    try {
+        var missing = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one' } });
+        assert.equal(missing.json.error.code, 'DEVICE_INVALID');
+        var login = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_A } });
+        assert.equal(login.status, 200);
+        var noDevice = await api(t, 'GET', '/api/me', { token: login.json.token });
+        assert.equal(noDevice.json.error.code, 'DEVICE_INVALID');
+        var wrong = await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_B });
+        assert.equal(wrong.json.error.code, 'VIP_DEVICE_MISMATCH');
+        var stored = await t.store.getSession(login.json.session.id);
+        assert.equal(stored.deviceId, DEV_A);
+        assert.notEqual(stored.tokenHash, login.json.token);
+        assert.equal(stored.tokenHash.length, 64);
+        assert.ok(login.json.session.expiresAt > t.now());
+    } finally { await t.close(); }
+});
+
+test('VIP binds once; same device succeeds, other device denied; logout does not unbind', async function () {
+    var t = await startApp();
+    try {
+        for (var i = 0; i < 2; i++) {
+            var login = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'VIP_ONE', deviceId: DEV_A } });
+            assert.equal(login.status, 200);
+        }
+        assert.equal((await api(t, 'POST', '/api/auth/logout', { token: login.json.token, deviceId: DEV_A })).status, 200);
+        var denied = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_B } });
+        assert.equal(denied.json.error.code, 'VIP_DEVICE_MISMATCH');
+        var acc = await t.store.getAccountByNameKey('vip_one');
+        assert.equal((await t.store.getVipDevice(acc.id)).deviceId, DEV_A);
+        assert.equal(acc.lastDeviceId, DEV_A);
+    } finally { await t.close(); }
+});
+
+test('Free expires at 48h; Free record and multiple VIP bindings coexist on one device', async function () {
+    var t = await startApp();
+    try {
+        var free = await api(t, 'POST', '/api/auth/register-free', { body: { name: 'Free Example', deviceId: DEV_A } });
+        var before = await t.store.getAccountByNameKey('free example');
+        var oldRecord = JSON.stringify(await t.store.getFreeDevice(DEV_A));
+        t.advance(48 * 3600 * 1000);
+        assert.equal((await api(t, 'GET', '/api/me', { token: free.json.token })).json.error.code, 'FREE_EXPIRED');
+        for (var name of ['vip_one', 'vip_two']) {
+            assert.equal((await api(t, 'POST', '/api/auth/login-vip', { body: { name, deviceId: DEV_A } })).status, 200);
+        }
+        assert.equal(JSON.stringify(await t.store.getFreeDevice(DEV_A)), oldRecord);
+        assert.deepEqual(await t.store.getAccountByNameKey('free example'), before);
+        assert.equal((await api(t, 'POST', '/api/auth/register-free', { body: { name: 'Another Free', deviceId: DEV_A } })).json.error.code, 'DEVICE_REGISTERED');
+    } finally { await t.close(); }
+});
+
+test('Reopen/restart uses saved session; simulated reinstall only succeeds with restored ID', async function () {
+    var t = await startApp();
+    var file = t.dataFile;
+    var token;
+    try {
+        token = (await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_A } })).json.token;
+    } finally { await t.close(); }
+    var t2 = await startApp({ dataFile: file });
+    try {
+        assert.equal((await api(t2, 'GET', '/api/me', { token, deviceId: DEV_A })).status, 200);
+        assert.equal((await api(t2, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_B } })).status, 403);
+        assert.equal((await api(t2, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_A } })).status, 200);
+        assert.equal((await api(t2, 'POST', '/api/auth/login-vip', { body: { name: 'vip_two', deviceId: DEV_A } })).status, 200);
+    } finally { await t2.close(); }
+});
+
+test('VIP session expires exactly at its deadline; legacy sessions require login again', async function () {
+    var t = await startApp();
+    try {
+        var login = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_A } });
+        var session = await t.store.getSession(login.json.session.id);
+        session.deviceId = null;
+        assert.equal((await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_A })).json.error.code, 'SESSION_INVALID');
+        session.deviceId = DEV_A;
+        t.setNow(login.json.session.expiresAt);
+        assert.equal((await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_A })).json.error.code, 'SESSION_EXPIRED');
+    } finally { await t.close(); }
+});
+
+test('Concurrent HTTP logins cannot claim one VIP for two devices', async function () {
+    var t = await startApp();
+    try {
+        var results = await Promise.all([DEV_A, DEV_B].map(deviceId => api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId } })));
+        assert.deepEqual(results.map(r => r.status).sort(), [200, 403]);
+        assert.equal(Object.keys(t.store.doc.vipBindings).length, 1);
+        assert.equal((await t.store.listAccounts()).length, 1);
+    } finally { await t.close(); }
+});
+
+test('VIP removed at TTL loses access on an existing session without restart', async function () {
+    var t = await startApp();
+    try {
+        var login = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_A } });
+        t.config.vipListStatic = '[]';
+        assert.equal((await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_A })).status, 200);
+        t.advance(t.config.vipListTtlMs);
+        assert.equal((await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_A })).json.error.code, 'VIP_INACTIVE');
+        assert.equal((await api(t, 'GET', '/health')).json.vipList.count, 0);
+        var acc = await t.store.getAccountByNameKey('vip_one');
+        assert.equal((await t.store.getVipDevice(acc.id)).deviceId, DEV_A, 'revocation does not release binding');
+    } finally { await t.close(); }
+});
+
+test('DB failures at binding lookup/claim/session write fail closed and hide internals', async function () {
+    var t = await startApp();
+    try {
+        var login = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_A } });
+        var down = async () => { var e = new Error('sensitive-database-detail'); e.code = 'ECONNREFUSED'; throw e; };
+        t.store.getVipDevice = down;
+        var me = await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_A });
+        assert.equal(me.status, 500);
+        assert.ok(!JSON.stringify(me.json).includes('sensitive-database-detail'));
+        var original = t.store.claimVipDevice;
+        t.store.claimVipDevice = down;
+        var denied = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_two', deviceId: DEV_A } });
+        assert.equal(denied.status, 500);
+        assert.equal(denied.json.token, undefined);
+        t.store.claimVipDevice = original;
+        t.store.createSession = down;
+        assert.equal((await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_two', deviceId: DEV_A } })).status, 500);
+        t.store.ping = down;
+        var health = await api(t, 'GET', '/health');
+        assert.equal(health.json.store.ok, false);
+        assert.equal(health.json.store.error, 'STORE_UNAVAILABLE');
+    } finally { await t.close(); }
+});
+
+test('Legacy Free upgraded to VIP cannot restore a VIP token from device ID alone', async function () {
+    var t = await startApp();
+    try {
+        var free = await api(t, 'POST', '/api/auth/register-free', { body: { name: 'Upgrade Example', deviceId: DEV_A } });
+        t.config.vipListStatic = '["Upgrade Example"]';
+        t.advance(t.config.vipListTtlMs);
+        assert.equal((await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'Upgrade Example', deviceId: DEV_A } })).status, 200);
+        assert.equal((await api(t, 'POST', '/api/auth/restore', { body: { deviceId: DEV_A } })).json.error.code, 'SESSION_REQUIRED');
+        assert.equal((await api(t, 'GET', '/api/me', { token: free.json.token, deviceId: DEV_A })).json.error.code, 'SESSION_INVALID');
+        assert.ok(await t.store.getFreeDevice(DEV_A));
+    } finally { await t.close(); }
+});
+
+test('VIP source outage denies old sessions and new logins, then recovers without restart', async function () {
+    var t = await startApp();
+    try {
+        var login = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_one', deviceId: DEV_A } });
+        t.config.vipListStatic = '<html>unverified content</html>';
+        t.advance(t.config.vipListTtlMs);
+        assert.equal((await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_A })).json.error.code, 'VIP_SOURCE_UNAVAILABLE');
+        var blocked = await api(t, 'POST', '/api/auth/login-vip', { body: { name: 'vip_two', deviceId: DEV_A } });
+        assert.equal(blocked.status, 503);
+        assert.equal(blocked.json.token, undefined);
+        t.config.vipListStatic = '["vip_one","vip_two"]';
+        t.advance(5000);
+        assert.equal((await api(t, 'GET', '/api/me', { token: login.json.token, deviceId: DEV_A })).status, 200);
     } finally { await t.close(); }
 });

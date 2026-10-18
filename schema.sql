@@ -104,3 +104,13 @@ CREATE TABLE IF NOT EXISTS watch_history (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (account_id, episode_id)
 );
+
+-- Additive VIP binding migration. Do NOT infer ownership from last_device_id.
+-- device_id is deliberately NOT UNIQUE: one device may use many VIP accounts.
+CREATE TABLE IF NOT EXISTS vip_device_bindings (
+    account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL CHECK (device_id ~ '^[A-Za-z0-9_-]{16,128}$'),
+    bound_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_id TEXT;
+-- Legacy VIP sessions have NULL device_id and must log in again.

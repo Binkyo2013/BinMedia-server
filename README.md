@@ -36,7 +36,8 @@ node server.js
 Chạy test:
 
 ```bash
-npm test        # node --test — 45 test: auth, store, nguồn, e2e toàn luồng
+npm ci
+npm test        # unit + e2e; PostgreSQL integration skipped unless configured
 ```
 
 ## 3. Biến môi trường
@@ -69,13 +70,14 @@ npm test        # node --test — 45 test: auth, store, nguồn, e2e toàn luồ
 |---|---|---|
 | `VIP_SOURCE` | tự nhận | `gitlab` \| `static` \| `file` |
 | `GITLAB_API_URL` | `https://gitlab.com/api/v4` | API GitLab |
-| `GITLAB_PROJECT_ID` | | ID/URL-encoded path của project chứa danh sách |
+| `GITLAB_PROJECT_ID` | | ID số hoặc path THÔ của project (vd. group/project); code tự URL-encode |
 | `GITLAB_VIP_PATH` | `vip.txt` | Đường dẫn file danh sách (JSON array hoặc mỗi tên một dòng) |
 | `GITLAB_VIP_REF` | `main` | Nhánh |
 | `GITLAB_TOKEN` | | **Chỉ tồn tại ở server** — app không bao giờ giữ token này |
 | `VIP_LIST_STATIC` / `VIP_LIST_FILE` | | Cho dev/test |
 | `VIP_LIST_TTL_MS` | `60000` | TTL cache danh sách |
-| `VIP_STALE_MAX_MS` | `86400000` | Dùng dữ liệu cũ tối đa khi GitLab lỗi (sau đó → không xác minh được) |
+| `VIP_STALE_MAX_MS` | *(deprecated)* | Không còn dùng để cấp quyền; dữ liệu quá TTL luôn bị từ chối nếu tải lại lỗi |
+| `VIP_SESSION_TTL_MS` | `2592000000` | Session VIP hết hạn sau 30 ngày; số nguyên dương, đơn vị ms |
 
 ### Tài khoản Free / khóa VIP
 | Biến | Mặc định | Ý nghĩa |
@@ -105,14 +107,32 @@ npm test        # node --test — 45 test: auth, store, nguồn, e2e toàn luồ
 - `POST /api/auth/restore` `{ deviceId }`: thiết bị đã đăng ký lấy lại session khi
   còn hạn; hết hạn → `403 FREE_EXPIRED` (app chuyển sang luồng VIP).
 
-### VIP — không giới hạn khi còn quyền
-- Chỉ cần **tên tài khoản VIP**. Server tra tên trong **danh sách VIP trên GitLab**
-  (chuẩn hóa: NFC, bỏ khoảng trắng thừa, so khớp không phân biệt hoa/thường).
-- `POST /api/auth/login-vip` `{ name, deviceId? }` → session VIP
-  (`expiresAt = null`), thu hồi được bằng admin.
-- Mỗi lần kiểm tra session, server **xác minh lại** quyền VIP — bị gỡ khỏi danh
-  sách → `403 VIP_INACTIVE`.
-- Tên Free được admin đưa vào danh sách VIP → được nâng quyền theo server.
+### VIP — quyền theo GitLab, ràng buộc một thiết bị
+- `POST /api/auth/login-vip` yêu cầu `{ name, deviceId }` (Device ID bắt buộc).
+- Tên được chuẩn hóa NFC, trim/gộp khoảng trắng, không phân biệt hoa/thường.
+- Backend kiểm tra danh sách GitLab rồi tạo/kiểm tra liên kết trong PostgreSQL:
+  tài khoản chưa có liên kết → ghi nhận; cùng thiết bị → cho phép;
+  khác thiết bị → `403 VIP_DEVICE_MISMATCH`, không ghi đè liên kết.
+- `vip_device_bindings.account_id` là PRIMARY KEY; `device_id` không UNIQUE.
+  Một thiết bị được dùng nhiều VIP, đồng thời giữ nguyên liên kết Free cũ.
+  Tạo tài khoản và claim liên kết dùng transaction + khóa hàng, không chỉ kiểm tra RAM.
+- Đăng xuất/thu hồi session/xóa tên khỏi GitLab không tự gỡ liên kết thiết bị.
+  **Chưa có API chuyển thiết bị**; không tự ý sửa liên kết để né lỗi.
+- Mỗi yêu cầu dùng session VIP phải gửi **cả** Bearer token và `X-Device-ID`.
+  Backend đối chiếu session → tài khoản → liên kết thiết bị → danh sách VIP hiện tại.
+- Session hết hạn sau 30 ngày mặc định, không phải quyền VIP hết hạn sau 30 ngày.
+- Cache VIP có TTL thật (mặc định 60s), refresh theo yêu cầu, single-flight trong
+  mỗi tiến trình. Hết TTL, yêu cầu chờ tải lại; lỗi → `503 VIP_SOURCE_UNAVAILABLE`,
+  **không xác thực bằng stale cache**. Retry có tiết lưu tối đa 5s khi nguồn lỗi.
+  Không có timer nền khi không có yêu cầu; `/health` báo trạng thái cache, không tải lại.
+- Danh sách rỗng hợp lệ thu hồi toàn bộ VIP, không cấp quyền cho ai. Nội dung lỗi
+  không được coi là danh sách hợp lệ. JSON phải là mảng toàn chuỗi tên hợp lệ;
+  định dạng mỗi tên một dòng vẫn hỗ trợ.
+- Gỡ VIP khỏi GitLab ảnh hưởng session cũ chậm nhất khi cache hết TTL và yêu cầu
+  xác thực tiếp theo chạy; nguồn lỗi sau TTL cũng bị từ chối. Binding vẫn được giữ.
+- Free được đưa vào danh sách VIP vẫn nâng quyền theo luồng cũ; giữ bản ghi thiết bị
+  Free và mốc expiry cũ để bảo toàn dữ liệu. Session Free cũ không thành session VIP;
+  `/api/auth/restore` không cấp session VIP chỉ từ Device ID.
 
 ### Khóa VIP — 5 lần sai → 5 phút
 - 5 lần nhập tên VIP sai **liên tiếp** (thành công sẽ reset bộ đếm) → khóa đăng nhập
@@ -138,6 +158,7 @@ npm test        # node --test — 45 test: auth, store, nguồn, e2e toàn luồ
 | `VIP_INVALID` | 401 | Tên VIP sai (không hé lộ danh sách) |
 | `FREE_EXPIRED` | 403 | Free hết 48 giờ |
 | `VIP_INACTIVE` | 403 | Quyền VIP không còn hiệu lực |
+| `VIP_DEVICE_MISMATCH` | 403 | Tài khoản/session VIP liên kết với thiết bị khác; không tự chuyển |
 | `ADMIN_FORBIDDEN` | 403 | Sai admin token |
 | `HISTORY_CONSENT_REQUIRED` / `HISTORY_DISABLED` | 403 | Lịch sử xem cần đồng ý / đang tắt |
 | `NO_ACCOUNT` / `NOT_FOUND` | 404 | Không tìm thấy |
@@ -150,14 +171,15 @@ npm test        # node --test — 45 test: auth, store, nguồn, e2e toàn luồ
 
 ## 5. API
 
-Mọi endpoint `/api/*` (trừ auth) yêu cầu `Authorization: Bearer <session token>`.
+API người dùng được bảo vệ yêu cầu `Authorization: Bearer <session token>`.
+Session VIP còn yêu cầu `X-Device-ID: <deviceId>`. API admin dùng token admin riêng.
 
 | Method | Path | Mô tả |
 |---|---|---|
 | GET | `/health` | Giám sát: store, danh sách VIP, thời gian server |
 | POST | `/api/auth/register-free` | Đăng ký Free `{name, deviceId}` → token + account |
 | POST | `/api/auth/restore` | Khôi phục session theo `deviceId` |
-| POST | `/api/auth/login-vip` | Đăng nhập VIP `{name, deviceId?}` |
+| POST | `/api/auth/login-vip` | Đăng nhập VIP `{name, deviceId}` |
 | GET | `/api/me` | Kiểm tra session + trạng thái tài khoản (kèm `serverTime`) |
 | POST | `/api/auth/logout` | Thu hồi session hiện tại |
 | GET/POST/DELETE | `/api/history` | Lịch sử xem (POST cần đã đồng ý) |
@@ -200,10 +222,11 @@ Xem header `sources/facebook.js`. Tóm tắt:
 2. Tạo **Web Service** từ repo này:
    - Build: `npm install` · Start: `node server.js`
    - Env: `STORE_DRIVER=postgres`, `DATABASE_URL=...`, `ADMIN_TOKEN=...`,
-     `VIP_SOURCE=gitlab`, `GITLAB_PROJECT_ID=...`, `GITLAB_VIP_PATH=vip.txt`,
+     `VIP_SOURCE=gitlab`, `GITLAB_PROJECT_ID=...`, `GITLAB_VIP_PATH=Member_BinMedia.txt`,
      `GITLAB_TOKEN=...` (chỉ ở server).
 3. `schema.sql` tự chạy khi khởi động (`STORE_AUTO_MIGRATE=1`).
-4. File VIP trên GitLab: JSON array `["tên một","tên hai"]` hoặc mỗi tên một dòng.
+4. Health Check Path: `/health` (đường dẫn `/` không phải endpoint kiểm tra).
+5. File VIP trên GitLab: JSON array `["tên một","tên hai"]` hoặc mỗi tên một dòng.
 
 ## 8. Cấu trúc mã
 
@@ -224,3 +247,78 @@ bất kỳ ai biết tên VIP đều có thể thử. Đặc tả hiện tại t
 có thể nâng cấp sau (mật khẩu một lần, mã mời, xác thực thiết bị...). Các biện pháp
 bù đắp hiện có: khóa 5 phút + giới hạn tần suất theo IP/thiết bị/tên, session thu
 hồi được, không hé lộ danh sách VIP.
+
+## 10. Tích hợp app: mở lại, cài lại và giới hạn định danh
+
+Repo này **không có mã app BinMedia**. Backend chỉ nhận chuỗi `deviceId` do app gửi;
+không thể xác minh cách app tạo/lưu/khôi phục định danh, cũng không chứng thực phần cứng.
+
+1. App tạo ID ngẫu nhiên đủ mạnh (UUID/ít nhất 128 bit ngẫu nhiên), chuỗi 16–128 ký tự
+   `[A-Za-z0-9_-]`; không dùng IMEI, serial hoặc fingerprint ngầm. Ví dụ ID ngắn
+   `device-id-01` KHÔNG hợp lệ theo validator hiện có.
+2. Đăng nhập: gửi `{name, deviceId}` qua HTTPS. Không chứa token GitLab trong app.
+3. Lưu session token trong kho bí mật của hệ điều hành (Keychain hoặc dữ liệu mã hóa
+   bằng khóa Android Keystore), không SharedPreferences/AsyncStorage/plaintext file,
+   không log token. Không dùng tên + Device ID thay cho token để tự động vào app.
+4. Mở lại: gọi `GET /api/me` với Bearer token + `X-Device-ID`; chỉ vào giao diện chính
+   sau phản hồi thành công. Không lấy trạng thái UI lưu cục bộ làm bằng chứng quyền.
+5. `401`: session không hợp lệ/hết hạn/thu hồi → bỏ token và yêu cầu đăng nhập lại.
+   `403 VIP_INACTIVE`: dừng quyền VIP; `403 VIP_DEVICE_MISMATCH`: không đổi ID hoặc tự
+   chuyển liên kết. `400 DEVICE_INVALID`: kiểm tra tích hợp header/ID.
+   `503` hoặc lỗi DB/mạng: báo tạm không xác minh được, không tự cấp quyền/offline;
+   có thể giữ token an toàn để thử lại sau, không cần xóa session vì lỗi tạm thời.
+6. Gỡ app có thể mất token và ID. Không cam kết Keychain/Keystore/backup hệ điều hành
+   chắc chắn sống qua uninstall. Nếu app khôi phục đúng ID, người dùng đăng nhập lại
+   cùng VIP (hoặc VIP khác chưa liên kết) được; nếu ID thay đổi, VIP đã liên kết sẽ
+   bị từ chối. Không tìm tài khoản chỉ từ ID rồi cấp token VIP.
+7. Khôi phục ID qua tài khoản chủ sở hữu đã xác minh hoặc quy trình chuyển thiết bị
+   do admin duyệt là phương án tương lai cần thiết kế riêng, có đồng ý/quyền riêng tư;
+   chưa triển khai trong PR này. Test backend chỉ mô phỏng gửi lại ID cũ/mới, không
+   phải kiểm thử uninstall/reinstall trên Android/iOS thật.
+
+**Giới hạn bảo mật còn tồn tại:** tên VIP không phải bí mật xác thực. Người biết tên
+có thể claim tài khoản chưa liên kết trước chủ thật. ID do client khai báo có thể
+bị sao chép; token + ID bị đánh cắp vẫn có thể bị dùng lại. Ràng buộc này không thay
+thế mật khẩu/mã mời dùng một lần/chứng minh khóa thiết bị hoặc attestation. Cần cơ chế
+xác minh chủ sở hữu trước khi coi đây là chống giả mạo thiết bị hoàn chỉnh.
+
+## 11. Migration và triển khai an toàn
+
+- Chỉ thêm bảng `vip_device_bindings` và cột nullable `sessions.device_id` bằng
+  `IF NOT EXISTS`. Không xóa bảng, reset DB, backfill từ `last_device_id`, hoặc thay
+  UNIQUE của dữ liệu Free. Dữ liệu Free và session cũ được giữ nguyên.
+- VIP cũ chưa có binding được claim trong lần đăng nhập thành công đầu tiên sau
+  nâng cấp. `last_device_id` cũ không chứng minh quyền sở hữu. Nếu không chấp nhận
+  rủi ro first-claim, **chưa deploy**: cần xác minh chủ sở hữu và lập kế hoạch liên kết
+  tài khoản cũ có kiểm soát trước. PR này không tự chuyển dữ liệu sở hữu.
+- Session VIP cũ chưa có `device_id` bị từ chối, phải đăng nhập lại; không tự nâng
+  session Free thành VIP. App cũ không gửi header sẽ không dùng được API VIP mới.
+  Cần cập nhật app phối hợp trước khi rollout backend.
+- Trước production: tạo backup/snapshot PostgreSQL, xác nhận khôi phục được, chạy
+  migration trên staging với bản sao dữ liệu đã bảo vệ. DDL có thể lấy khóa ngắn;
+  triển khai trong khung giờ phù hợp, tránh nhiều phiên bản backend cũ/mới cùng ghi.
+- Với auto-migrate bật, schema chạy khi server khởi động; nếu tắt, người vận hành
+  chạy `schema.sql` trong transaction qua công cụ PostgreSQL trước khi chạy code mới.
+  Không dán URL DB vào chat/log/lệnh lưu trong repository.
+- Giữ env Render hiện có `STORE_DRIVER=postgres`, Internal `DATABASE_URL`, nguồn VIP
+  `VIP_SOURCE=gitlab` + project/path/ref riêng, token chỉ trong env secret nếu cần.
+  Không cần biến mới bắt buộc. Có thể cấu hình `VIP_SESSION_TTL_MS` (mặc định 30 ngày),
+  `VIP_LIST_TTL_MS` (mặc định 60s); `VIP_STALE_MAX_MS` không còn cho phép stale auth.
+- Sau deploy kiểm tra health + đăng nhập bằng dữ liệu staging/được phép, khởi động
+  lại rồi kiểm tra liên kết/session. GET health không chứng minh các luồng ghi đúng.
+- Rollback không cần xóa cấu trúc mới, nhưng code cũ không thực thi binding: rollback
+  backend là giảm bảo mật, cần kiểm soát truy cập, không coi là biện pháp tự động an toàn.
+
+## 12. Kiểm thử PostgreSQL cục bộ
+
+`npm test` chạy unit/e2e, suite PostgreSQL sẽ skip nếu thiếu
+`BINMEDIA_TEST_DATABASE_URL`. Để chạy đầy đủ, cấp biến này qua môi trường test an toàn
+trỏ tới PostgreSQL **cục bộ dùng riêng cho test**, rồi chạy `npm test`.
+Suite từ chối host không phải localhost; tạo/xóa duy nhất schema ngẫu nhiên của nó.
+Không dùng database production hoặc credentials thật trong test/commit.
+
+Suite kiểm tra migration lặp lại và giữ dữ liệu cũ, cạnh tranh claim từ nhiều kết nối,
+rollback khi constraint lỗi, nhiều VIP/cùng thiết bị, session hash + device, quyền VIP
+bị thu hồi, mất kết nối DB fail-closed. E2E kiểm tra Free 48h, khóa 5 lần/300s,
+restart/session tự xác thực, ID khôi phục/mất sau cài lại (mô phỏng), TTL + nguồn lỗi
+phục hồi, single-flight, parser/API GitLab bằng mock (không dùng dữ liệu VIP thật).
