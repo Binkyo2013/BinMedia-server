@@ -112,3 +112,12 @@ test('catalog: tìm phim theo slug hoặc id, lọc theo danh mục', async func
     var q = await store.listMovies({ q: 'hay' });
     assert.strictEqual(q.total, 1);
 });
+
+test('VIP binding persistence failure must not publish an in-memory claim', async function () {
+    var doc = storeLib.emptyDoc();
+    var store = new storeLib.DocumentStore({ load: async () => doc, save: async () => { throw new Error('disk unavailable'); } });
+    // No init needed: the initial document has no accounts/bindings.
+    await assert.rejects(store.claimVipDevice({ accountId: 'failed', name: 'Example VIP', nameKey: 'example vip', deviceId: 'd'.repeat(16), now: 1000 }));
+    assert.strictEqual(await store.getAccountByNameKey('example vip'), null);
+    assert.strictEqual(await store.getVipDevice('failed'), null);
+});
